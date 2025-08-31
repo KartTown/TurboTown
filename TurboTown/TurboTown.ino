@@ -1,8 +1,34 @@
+#ifndef ETH_PHY_MDC
+#define ETH_PHY_TYPE ETH_PHY_LAN8720
+#if CONFIG_IDF_TARGET_ESP32
+#define ETH_PHY_ADDR  0
+#define ETH_PHY_MDC   23
+
+#define ETH_PHY_MDIO  18
+#define ETH_PHY_POWER -1
+#define ETH_CLK_MODE  ETH_CLOCK_GPIO17_OUT
+#elif CONFIG_IDF_TARGET_ESP32P4
+#define ETH_PHY_ADDR  0
+#define ETH_PHY_MDC   31
+#define ETH_PHY_MDIO  52
+#define ETH_PHY_POWER 51
+#define ETH_CLK_MODE  EMAC_CLK_EXT_IN
+#endif
+#endif
+
+#include <ETH.h>
+
+#include <WiFiClient.h>
+#include <WiFiServer.h>
+
+#include <SPI.h>
+
 #include <Wire.h>
-#include <Ethernet.h>
 
 #define DEBUG_MODE 0
 
+#define EN_COM 0
+#define EN_LAPS 1
 #define EN_MEDIA 1
 
 #define MAX_COM_LEN 110
@@ -12,6 +38,9 @@
 
 #define PIN_LED_RED 2
 #define PIN_LED_GREEN 15
+
+#define I2C_SDA 4
+#define I2C_SCL 16
 
 #define REV_TIME 10000 
 #define RACE_TIME 300000
@@ -50,7 +79,9 @@ static unsigned long timeFirstRace = 0;
 static unsigned long timeEnd = 0;
 static unsigned long timeFirstEnd = 0;
 
-Device server = {
+static const byte I2C_LAP_ADDRESS = 0x50;
+
+Device serverInfo = {
   80,  
   {192, 168, 2, 10},                      // Network Address
   {192, 168, 2, 1},                       // Gateway Address
@@ -58,7 +89,7 @@ Device server = {
   {0x90, 0xA2, 0xDA, 0x0D, 0x2D, 0x3F},   // MAC Address
 };
 #if EN_MEDIA == 1
-Device media = {
+Device mediaInfo = {
   80,  
   {192, 168, 2, 11},                      // Network Address
   {192, 168, 2, 1},                       // Gateway Address
@@ -70,7 +101,8 @@ static char command[MAX_COM_LEN] = "{\"jsonrpc\":\"2.0\",\"method\":\"Player.Ope
 static char buffer[MAX_COM_LEN];
 #endif
 
-EthernetClient client;                           
+NetworkServer server(serverInfo.port);                            // Set Server Port
+NetworkClient media;                         
 
 void setup()
 { 
@@ -84,13 +116,28 @@ void setup()
   //Set up output pins
   pinMode(PIN_LED_RED, OUTPUT);
   pinMode(PIN_LED_GREEN, OUTPUT);
- 
-  Ethernet.begin(server.MAC, server.IP, server.gateway, server.subnet);          
+
+  //Set up I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+  
+  //Set up ethernet
+  Network.onEvent(onEvent);
+
+  ETH.begin(
+    ETH_PHY_TYPE,
+    ETH_PHY_ADDR,
+    ETH_PHY_MDC,
+    ETH_PHY_MDIO,
+    ETH_PHY_POWER,
+    ETH_CLK_MODE);
+  ETH.config(
+    IPAddress(serverInfo.IP),
+    IPAddress(serverInfo.subnet));
+
+  server.begin(80);            
 
   #if EN_MEDIA == 1
-  if(client.connect(media.IP,media.port)){
-    
-  }      
+  media.connect(mediaInfo.IP,mediaInfo.port);      
   #endif                                                                             
 }                                                   
 
@@ -103,7 +150,100 @@ void loop()
   #if EN_MEDIA == 1
   MEDIA_ACTION();
   #endif    
-}                               
+}     
+
+void onEvent(arduino_event_id_t event)
+{
+  switch(event){
+    case ARDUINO_EVENT_ETH_START:
+    #if DEBUG_MODE == 1
+    Serial.println("[Eth:Start]");
+    #endif
+    ETH.setHostname("A2");
+    break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+    #if DEBUG_MODE == 1
+    Serial.println("[Eth:Connect]");
+    #endif
+    break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+    #if DEBUG_MODE == 1
+    Serial.println("[Eth:IP]");
+    #endif
+    break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+    #if DEBUG_MODE == 1
+    Serial.println("[Eth:Disconnect]");
+    #endif
+    break;
+    case ARDUINO_EVENT_ETH_STOP:
+    #if DEBUG_MODE == 1
+    Serial.println("[Eth:Stop]");
+    #endif
+    break;
+    default:
+    break;
+  }
+}
+
+ #if EN_COM == 1
+bool isValid(char* command)
+{
+  int mode = command[2] - '0';
+  return (((command[0] == 0x52) || (command[0] == 0x47)) && mode < 3); 
+}
+#endif
+
+ #if EN_COM == 1
+void handleCommand(NetworkClient* client, char* command)
+{
+  //Byte Guide:
+  //0: 0x30
+  //1: 0x31
+  //2: 0x32
+  //R: 0x52
+  //G: 0x47
+  //[]:0x5B,0x5D
+  #if DEBUG_MODE == 1
+  Serial.print(command);
+  Serial.print(":");
+  #endif
+  char response[4] = "[0]";
+
+  if(!isValid(command)){
+    #if DEBUG_MODE == 1
+    Serial.println(response);
+    #endif
+    response[1] = 0x30;   
+    client.println(response);  
+    return;    
+  }
+
+  int pin = (command[0] == 0x52) ? PIN_LED_RED : PIN_LED_GREEN;
+  switch(command[2]){
+    case 0x30:
+    state = State::OFF;
+    break;
+    case 0x31:
+    state = (command[0] == 0x52) ? State::RED_ON : State::GREEN_ON;
+    break;
+    case 0x32:
+    state = (command[0] == 0x52) ? State::RED_FLASH : State::GREEN_FLASH;
+    break;
+    default:
+    state = State::OFF;
+    break;         
+  }
+
+  response[1] = 0x31;
+  
+  #if DEBUG_MODE == 1
+  Serial.println(response);
+  #endif
+
+  client.println(response);
+}
+#endif
 
 void CHECK_STATE()
 {
@@ -162,6 +302,10 @@ void READY_RACE()
 
 void START_RACE()
 {
+  #if EN_LAPS == 1
+  LAPS_ACTION();
+  #endif
+
   timeRace = millis() - timeFirstRace;
 
   //Stay in race mode until timer runs out
@@ -228,21 +372,33 @@ void LED_ON(int pin)
   digitalWrite(pin, HIGH);
 }
 
+#if EN_LAPS == 1
+void LAPS_ACTION(){
+  byte receivedData;
+  int bytesToRead = 1;
+  Wire.requestFrom(I2C_LAP_ADDRESS, bytesToRead);
+
+  if(Wire.available()){
+    receivedData = Wire.read();
+  }
+}
+#endif
+
 #if EN_MEDIA == 1
 void MEDIA_ACTION()
 {
   //If connected, take appropriate action
-  if(client.connected()){
+  if(media.connected()){
     if(file[0] != '0'){
       sprintf(buffer,command,file);
-      client.println(buffer);
+      media.println(buffer);
       file[0] = '0';
     }
   } 
   //Try to reconnect
   else{
     //Reconnect if connection is lost
-    if(client.connect(media.IP, media.port)) {
+    if(media.connect(mediaInfo.IP, mediaInfo.port)) {
     } 
     else{
     }
